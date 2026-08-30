@@ -225,8 +225,9 @@ function wsGetSequenceClipsRange(seqId, mode) {
         // all / inout
         var inSec = -1, outSec = -1;
         if (mode === 'inout') {
-            try { inSec = seq.getInPoint().seconds; } catch (e) {}
-            try { outSec = seq.getOutPoint().seconds; } catch (e) {}
+            // getInPoint() / getOutPoint() 返回 Real（秒），不是 Time 对象
+            try { inSec = seq.getInPoint(); } catch (e) {}
+            try { outSec = seq.getOutPoint(); } catch (e) {}
             if (inSec < 0 || outSec <= inSec) {
                 return JSON.stringify({ error: '无法读取序列出入点，请先在时间轴设置入点(I)和出点(O)' });
             }

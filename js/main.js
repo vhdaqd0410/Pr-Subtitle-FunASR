@@ -41,6 +41,7 @@
         exportSrt: document.getElementById('btnExportSrt'),
         btnSeparate: document.getElementById('btnSeparate'),
         btnImportVocals: document.getElementById('btnImportVocals'),
+        btnImportAccomp: document.getElementById('btnImportAccomp'),
         sepProgressWrap: document.getElementById('sepProgressWrap'),
         sepProgressFill: document.getElementById('sepProgressFill'),
         sepProgressText: document.getElementById('sepProgressText'),
@@ -172,6 +173,7 @@
         var useGpu = el.chkGpu.checked;
         var modelName = el.selModel.value;
         var lang = el.selLang.value;
+        var rangeMode = el.selRange.value;   // 'all' | 'inout' | 'selection'
 
         var ffmpegPath = path.join(extRoot, 'bin', 'ffmpeg-win32-x64.exe');
         // GPU 自动检测：能加载 cuda 库就用 CUDA 版，否则降级纯 CPU 版
@@ -829,8 +831,9 @@
                         sepVocalsPath = outVocals;
                         sepAccompPath = fs.existsSync(outAccomp) ? outAccomp : null;
                         el.btnImportVocals.disabled = false;
+                        if (sepAccompPath) el.btnImportAccomp.disabled = false;
                         setSepBusy(false);
-                        setSepStatus('分离完成：人声 + 伴奏已生成，点「导入到素材箱」放入「人声分离」bin', 'ok');
+                        setSepStatus('分离完成：可分别导入人声 / 伴奏到「人声分离」素材箱', 'ok');
                     });
                 });
             });
@@ -838,18 +841,26 @@
     }
 
     function importVocals() {
-        if (!sepVocalsPath) { setSepStatus('请先分离人声', 'err'); return; }
-        var files = [sepVocalsPath];
-        if (sepAccompPath) files.push(sepAccompPath);
-        setSepStatus('正在导入素材箱...', '');
-        var payloadJson = JSON.stringify(files);
+        importToBin([sepVocalsPath], '人声');
+    }
+
+    function importAccomp() {
+        importToBin([sepAccompPath], '伴奏');
+    }
+
+    // 通用导入：把文件列表放进「人声分离」素材箱，kind 用于提示文案
+    function importToBin(files, kind) {
+        var validFiles = files.filter(function (f) { return f && fs.existsSync(f); });
+        if (validFiles.length === 0) { setSepStatus('请先分离出' + kind, 'err'); return; }
+        setSepStatus('正在导入' + kind + '到素材箱...', '');
+        var payloadJson = JSON.stringify(validFiles);
         var setScript = 'wsImportToBinPayload = ' + payloadJson + ';';
         csInterface.evalScript(setScript, function () {
             csInterface.evalScript('wsImportToBinStr("人声分离")', function (result) {
                 try {
                     var data = JSON.parse(result);
                     if (data.ok) {
-                        setSepStatus('已导入「人声分离」素材箱：' + data.imported.join('、'), 'ok');
+                        setSepStatus('已导入' + kind + '到「人声分离」素材箱：' + data.imported.join('、'), 'ok');
                     } else {
                         setSepStatus(data.error || '导入失败', 'err');
                     }
@@ -869,6 +880,7 @@
         sepBusy = busy;
         el.btnSeparate.disabled = busy;
         el.btnImportVocals.disabled = busy || !sepVocalsPath;
+        el.btnImportAccomp.disabled = busy || !sepAccompPath;
         if (busy) {
             el.sepProgressWrap.classList.add('show');
             el.sepProgressFill.className = 'fill indet';
@@ -898,6 +910,7 @@
 
     el.btnSeparate.addEventListener('click', separateVocals);
     el.btnImportVocals.addEventListener('click', importVocals);
+    el.btnImportAccomp.addEventListener('click', importAccomp);
 
     // 语言切换时联动模型框：中文→FunASR（固定，置灰）；英文/其他→whisper large-v3
     function syncModelByLang() {
