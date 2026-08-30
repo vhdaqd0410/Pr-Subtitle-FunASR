@@ -240,6 +240,13 @@
             <option value="ja">日语</option>
             <option value="ko">韩语</option>
         </select>
+        <label style="margin-top:10px;">识别基准</label>
+        <select id="selRange">
+            <option value="all" selected>整条时间轴</option>
+            <option value="inout">入点到出点</option>
+            <option value="selection">选中的片段</option>
+        </select>
+        <div class="note" style="color:var(--muted); font-size:11px; margin-top:4px;">入点/出点：先在时间轴按 I / O 设置范围；选中片段：先在时间轴点选块</div>
         <label style="margin-top:10px;">模型</label>
         <select id="selModel">
             <option value="funasr-zh">FunASR（中文·paraformer，1.2GB）</option>
@@ -274,6 +281,20 @@
             <button id="btnWriteBack">回写当前序列</button>
             <button id="btnExportSrt" class="secondary">导出当前 SRT</button>
         </div>
+    </div>
+
+    <div class="card">
+        <h2>5 · 人声分离</h2>
+        <div class="note" style="color:var(--muted); font-size:11px; margin-bottom:8px;">先在时间轴选中含人声+伴奏的音频块，再点分离。Spleeter 本地引擎，无需联网。</div>
+        <div class="row">
+            <button id="btnSeparate">分离人声 / 伴奏</button>
+            <button id="btnImportVocals" class="secondary" disabled>导入到素材箱</button>
+        </div>
+        <div class="progress-wrap" id="sepProgressWrap">
+            <div class="progress-bar"><div class="fill indet" id="sepProgressFill"></div></div>
+            <div id="sepProgressText"></div>
+        </div>
+        <div id="sepStatus"></div>
     </div>
 
     <script src="js/CSInterface.js"></script>

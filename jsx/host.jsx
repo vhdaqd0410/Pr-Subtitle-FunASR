@@ -181,6 +181,152 @@ function wsWriteBack(seqId) {
     }
 }
 
+// ---------- 读取序列片段（三种识别基准）----------
+// mode: 'all' 整轴 | 'inout' 出入点区间 | 'selection' 选中块
+function wsGetSequenceClipsRange(seqId, mode) {
+    try {
+        var seq = wsFindSequence(seqId);
+        if (!seq) return JSON.stringify({ error: '找不到序列' });
+
+        var clips = [];
+        var i, j;
+
+        if (mode === 'selection') {
+            var sel = seq.getSelection();
+            if (!sel || sel.length === 0) {
+                return JSON.stringify({ error: '当前序列没有选中的片段，请先在时间轴选中音频/视频块' });
+            }
+            for (i = 0; i < sel.length; i++) {
+                var sc = sel[i];
+                var sp = getClipMediaPath(sc);
+                if (!sp) continue;
+                var sip = sc.inPoint ? sc.inPoint.seconds : 0;
+                var sop = sc.outPoint ? sc.outPoint.seconds : 0;
+                clips.push({
+                    mediaPath: sp,
+                    seqStart: sc.start ? sc.start.seconds : 0,
+                    inPoint: sip,
+                    outPoint: sop,
+                    duration: sop - sip,
+                    trackType: 'audio',
+                    clipName: sc.name || ''
+                });
+            }
+            if (clips.length === 0) return JSON.stringify({ error: '选中的片段没有可用的媒体路径' });
+            return JSON.stringify({
+                clips: clips,
+                seqName: seq.name,
+                seqEnd: seq.end.seconds,
+                sourceTrack: 'audio',
+                mode: 'selection'
+            });
+        }
+
+        // all / inout
+        var inSec = -1, outSec = -1;
+        if (mode === 'inout') {
+            try { inSec = seq.getInPoint().seconds; } catch (e) {}
+            try { outSec = seq.getOutPoint().seconds; } catch (e) {}
+            if (inSec < 0 || outSec <= inSec) {
+                return JSON.stringify({ error: '无法读取序列出入点，请先在时间轴设置入点(I)和出点(O)' });
+            }
+        }
+
+        var audioClips = [], videoClips = [];
+        for (i = 0; i < seq.audioTracks.numTracks; i++) {
+            var atr = seq.audioTracks[i];
+            for (j = 0; j < atr.clips.numItems; j++) {
+                var aclip = atr.clips[j];
+                var aMediaPath = getClipMediaPath(aclip);
+                if (!aMediaPath) continue;
+                var ast = aclip.start.seconds;
+                var adur = aclip.outPoint.seconds - aclip.inPoint.seconds;
+                if (mode === 'inout' && (ast + adur <= inSec || ast >= outSec)) continue;
+                audioClips.push({
+                    mediaPath: aMediaPath,
+                    seqStart: ast,
+                    inPoint: aclip.inPoint.seconds,
+                    outPoint: aclip.outPoint.seconds,
+                    duration: adur,
+                    trackType: 'audio',
+                    clipName: aclip.name
+                });
+            }
+        }
+        for (i = 0; i < seq.videoTracks.numTracks; i++) {
+            var vtr = seq.videoTracks[i];
+            for (j = 0; j < vtr.clips.numItems; j++) {
+                var vclip = vtr.clips[j];
+                var vMediaPath = getClipMediaPath(vclip);
+                if (!vMediaPath) continue;
+                var vst = vclip.start.seconds;
+                var vdur = vclip.outPoint.seconds - vclip.inPoint.seconds;
+                if (mode === 'inout' && (vst + vdur <= inSec || vst >= outSec)) continue;
+                videoClips.push({
+                    mediaPath: vMediaPath,
+                    seqStart: vst,
+                    inPoint: vclip.inPoint.seconds,
+                    outPoint: vclip.outPoint.seconds,
+                    duration: vdur,
+                    trackType: 'video',
+                    clipName: vclip.name
+                });
+            }
+        }
+
+        if (audioClips.length > 0) clips = audioClips;
+        else clips = videoClips;
+
+        if (clips.length === 0) {
+            if (mode === 'inout') return JSON.stringify({ error: '出入点区间内没有可识别的音视频片段' });
+            return JSON.stringify({ error: '序列里没有可识别的音视频片段' });
+        }
+
+        return JSON.stringify({
+            clips: clips,
+            seqName: seq.name,
+            seqEnd: seq.end.seconds,
+            sourceTrack: audioClips.length > 0 ? 'audio' : 'video',
+            mode: mode
+        });
+    } catch (e) {
+        return JSON.stringify({ error: '读取序列失败: ' + e.toString() });
+    }
+}
+
+// ---------- 导入文件到指定素材箱（从全局变量读文件列表，避开 evalScript 转义地狱）----------
+function wsImportToBinStr(binName) {
+    try {
+        var files = wsImportToBinPayload;
+        if (!files || files.length === 0) return JSON.stringify({ error: '没有要导入的文件' });
+        var root = app.project.rootItem;
+        var bin = null;
+        for (var i = 0; i < root.children.numItems; i++) {
+            var c = root.children[i];
+            try {
+                if (c.name === binName) { bin = c; break; }
+            } catch (e) {}
+        }
+        if (!bin) {
+            try { bin = root.createBin(binName); } catch (e) {
+                return JSON.stringify({ error: '创建素材箱失败: ' + e.toString() });
+            }
+        }
+        var imported = [];
+        for (var j = 0; j < files.length; j++) {
+            var f = new File(files[j]);
+            if (!f.exists) { imported.push(f.name + '(不存在)'); continue; }
+            var ok = app.project.importFiles([f.fsName], true, bin, false);
+            if (ok) imported.push(f.name);
+            else imported.push(f.name + '(失败)');
+        }
+        return JSON.stringify({ ok: true, bin: binName, imported: imported });
+    } catch (e) {
+        return JSON.stringify({ error: '导入素材箱失败: ' + e.toString() });
+    }
+}
+
 function wsGetAllSequencesStr() { return wsGetAllSequences(); }
 function wsGetSequenceClipsStr(seqId) { return wsGetSequenceClips(seqId); }
+function wsGetSequenceClipsRangeStr(seqId, mode) { return wsGetSequenceClipsRange(seqId, mode); }
 function wsWriteBackStr(seqId) { return wsWriteBack(seqId); }

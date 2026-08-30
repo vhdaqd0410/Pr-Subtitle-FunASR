@@ -15,6 +15,9 @@
     var currentSeqId = null;     // 当前查看的序列 ID
     var batchResults = [];       // 批量结果 [{ seqId, name, status, count, subtitles }]
     var stopRequested = false;   // 停止标志
+    var sepVocalsPath = null;    // 人声分离产物：人声
+    var sepAccompPath = null;    // 人声分离产物：伴奏
+    var sepBusy = false;         // 分离是否进行中
 
     // DOM 引用
     var el = {
@@ -22,6 +25,7 @@
         refreshSeq: document.getElementById('btnRefreshSeq'),
         toggleAll: document.getElementById('btnToggleAll'),
         selLang: document.getElementById('selLang'),
+        selRange: document.getElementById('selRange'),
         selModel: document.getElementById('selModel'),
         chkGpu: document.getElementById('chkGpu'),
         batch: document.getElementById('btnBatch'),
@@ -34,7 +38,13 @@
         resultSummary: document.getElementById('resultSummary'),
         list: document.getElementById('subtitleList'),
         writeBack: document.getElementById('btnWriteBack'),
-        exportSrt: document.getElementById('btnExportSrt')
+        exportSrt: document.getElementById('btnExportSrt'),
+        btnSeparate: document.getElementById('btnSeparate'),
+        btnImportVocals: document.getElementById('btnImportVocals'),
+        sepProgressWrap: document.getElementById('sepProgressWrap'),
+        sepProgressFill: document.getElementById('sepProgressFill'),
+        sepProgressText: document.getElementById('sepProgressText'),
+        sepStatus: document.getElementById('sepStatus')
     };
 
     function setStatus(msg, type) {
@@ -216,7 +226,10 @@
                 return;
             }
             var seqId = ids[idx];
-            csInterface.evalScript('wsGetSequenceClipsStr("' + seqId + '")', function (result) {
+            var evalStr = (rangeMode === 'all')
+                ? 'wsGetSequenceClipsStr("' + seqId + '")'
+                : 'wsGetSequenceClipsRangeStr("' + seqId + '", "' + rangeMode + '")';
+            csInterface.evalScript(evalStr, function (result) {
                 try {
                     var data = JSON.parse(result);
                     if (data.error) {
@@ -697,6 +710,174 @@
         });
     }
 
+    // ---------- 人声分离（Spleeter 2-stem，本地引擎）----------
+    // 关键：sherpa-onnx-offline-source-separation 是纯 C++ 程序，
+    // 和 whisper 一样处理不了中文路径（内部 ANSI 代码页），
+    // 所以引擎 + 模型 + 输入输出 wav 全部放到英文目录。
+    function getSepDir() {
+        return path.join(os.homedir(), 'whisper_subtitle_sep');
+    }
+
+    function ensureSepAssets(cb) {
+        var sepDir = getSepDir();
+        var needed = [
+            { src: path.join(extRoot, 'bin', 'sherpa', 'sherpa-onnx-offline-source-separation.exe'), dst: path.join(sepDir, 'sherpa-onnx-offline-source-separation.exe') },
+            { src: path.join(extRoot, 'bin', 'sherpa', 'onnxruntime.dll'), dst: path.join(sepDir, 'onnxruntime.dll') },
+            { src: path.join(extRoot, 'bin', 'sherpa', 'onnxruntime_providers_shared.dll'), dst: path.join(sepDir, 'onnxruntime_providers_shared.dll') },
+            { src: path.join(extRoot, 'models', 'spleeter', 'sherpa-onnx-spleeter-2stems-fp16', 'vocals.fp16.onnx'), dst: path.join(sepDir, 'vocals.fp16.onnx') },
+            { src: path.join(extRoot, 'models', 'spleeter', 'sherpa-onnx-spleeter-2stems-fp16', 'accompaniment.fp16.onnx'), dst: path.join(sepDir, 'accompaniment.fp16.onnx') }
+        ];
+        try {
+            if (!fs.existsSync(sepDir)) fs.mkdirSync(sepDir, { recursive: true });
+        } catch (e) { return cb('无法创建分离工作目录: ' + e.toString()); }
+        var missing = [];
+        for (var i = 0; i < needed.length; i++) {
+            if (!fs.existsSync(needed[i].src)) {
+                missing.push(needed[i].src);
+                continue;
+            }
+            if (!fs.existsSync(needed[i].dst)) {
+                try { fs.copyFileSync(needed[i].src, needed[i].dst); } catch (e) {
+                    return cb('复制分离组件失败: ' + e.toString());
+                }
+            }
+        }
+        if (missing.length > 0) {
+            return cb('人声分离组件缺失: ' + missing.join(', '));
+        }
+        cb(null, sepDir);
+    }
+
+    function separateVocals() {
+        if (sepBusy) { setSepStatus('分离进行中...', 'warn'); return; }
+
+        // 找到当前活动序列
+        var active = null;
+        allSequences.forEach(function (s) { if (s.active) active = s; });
+        if (!active) { setSepStatus('请先刷新序列列表，确认当前活动序列', 'err'); return; }
+
+        setSepBusy(true);
+        setSepStatus('正在读取选中的片段...', '');
+        var ffmpegPath = path.join(extRoot, 'bin', 'ffmpeg-win32-x64.exe');
+        if (!fs.existsSync(ffmpegPath)) { setSepBusy(false); setSepStatus('FFmpeg 缺失', 'err'); return; }
+
+        csInterface.evalScript('wsGetSequenceClipsRangeStr("' + active.sequenceID + '", "selection")', function (result) {
+            var data;
+            try { data = JSON.parse(result); } catch (e) {
+                setSepBusy(false); setSepStatus('解析失败: ' + result, 'err'); return;
+            }
+            if (data.error || !data.clips || data.clips.length === 0) {
+                setSepBusy(false);
+                setSepStatus(data.error || '没有选中的片段', 'err');
+                return;
+            }
+            // 取选中的第一个（人声分离通常针对单个素材）
+            var clip = data.clips[0];
+            if (!clip.mediaPath) { setSepBusy(false); setSepStatus('选中的片段没有媒体路径', 'err'); return; }
+
+            ensureSepAssets(function (err, sepDir) {
+                if (err) { setSepBusy(false); setSepStatus(err, 'err'); return; }
+
+                var inputWav = path.join(sepDir, 'input.wav');
+                var vocalsWav = path.join(sepDir, 'vocals.wav');
+                var accompWav = path.join(sepDir, 'accomp.wav');
+                try {
+                    if (fs.existsSync(inputWav)) fs.unlinkSync(inputWav);
+                    if (fs.existsSync(vocalsWav)) fs.unlinkSync(vocalsWav);
+                    if (fs.existsSync(accompWav)) fs.unlinkSync(accompWav);
+                } catch (e) {}
+
+                // 输出文件用纯 ASCII 时间戳命名（sherpa 引擎处理不了中文文件名），
+                // 后缀 _voice / _music 便于导入后区分人声/伴奏
+                var ts = Date.now();
+                var outVocals = path.join(sepDir, 'voice_' + ts + '.wav');
+                var outAccomp = path.join(sepDir, 'music_' + ts + '.wav');
+
+                // 1. ffmpeg 从素材源切出选中块音频（对齐素材内 in~out）
+                var mixArgs = [
+                    '-ss', clip.inPoint.toFixed(3),
+                    '-t', (clip.outPoint - clip.inPoint).toFixed(3),
+                    '-i', clip.mediaPath,
+                    '-ac', '2', '-ar', '48000',
+                    '-y', inputWav
+                ];
+                setSepStatus('正在提取选中片段音频...', '');
+                child_process.execFile(ffmpegPath, mixArgs, { timeout: 300000, maxBuffer: 1024 * 1024 * 20 }, function (err) {
+                    if (err || !fs.existsSync(inputWav)) {
+                        setSepBusy(false);
+                        setSepStatus('提取音频失败: ' + (err ? err.message : '未生成 wav'), 'err');
+                        return;
+                    }
+
+                    // 2. 跑 sherpa 分离引擎（英文路径）
+                    var exe = path.join(sepDir, 'sherpa-onnx-offline-source-separation.exe');
+                    var sepArgs = [
+                        '--spleeter-vocals=' + path.join(sepDir, 'vocals.fp16.onnx'),
+                        '--spleeter-accompaniment=' + path.join(sepDir, 'accompaniment.fp16.onnx'),
+                        '--num-threads=4',
+                        '--input-wav=' + inputWav,
+                        '--output-vocals-wav=' + outVocals,
+                        '--output-accompaniment-wav=' + outAccomp
+                    ];
+                    setSepStatus('Spleeter 分离中（本地 CPU，很快）...', '');
+                    child_process.execFile(exe, sepArgs, { cwd: sepDir, timeout: 1800000, maxBuffer: 1024 * 1024 * 50 }, function (err2) {
+                        if (err2 || !fs.existsSync(outVocals)) {
+                            setSepBusy(false);
+                            setSepStatus('分离失败: ' + (err2 ? err2.message : '未生成人声文件'), 'err');
+                            return;
+                        }
+                        sepVocalsPath = outVocals;
+                        sepAccompPath = fs.existsSync(outAccomp) ? outAccomp : null;
+                        el.btnImportVocals.disabled = false;
+                        setSepBusy(false);
+                        setSepStatus('分离完成：人声 + 伴奏已生成，点「导入到素材箱」放入「人声分离」bin', 'ok');
+                    });
+                });
+            });
+        });
+    }
+
+    function importVocals() {
+        if (!sepVocalsPath) { setSepStatus('请先分离人声', 'err'); return; }
+        var files = [sepVocalsPath];
+        if (sepAccompPath) files.push(sepAccompPath);
+        setSepStatus('正在导入素材箱...', '');
+        var payloadJson = JSON.stringify(files);
+        var setScript = 'wsImportToBinPayload = ' + payloadJson + ';';
+        csInterface.evalScript(setScript, function () {
+            csInterface.evalScript('wsImportToBinStr("人声分离")', function (result) {
+                try {
+                    var data = JSON.parse(result);
+                    if (data.ok) {
+                        setSepStatus('已导入「人声分离」素材箱：' + data.imported.join('、'), 'ok');
+                    } else {
+                        setSepStatus(data.error || '导入失败', 'err');
+                    }
+                } catch (e) {
+                    setSepStatus('导入解析失败: ' + result, 'err');
+                }
+            });
+        });
+    }
+
+    function setSepStatus(msg, type) {
+        el.sepStatus.textContent = msg || '';
+        el.sepStatus.className = type || '';
+    }
+
+    function setSepBusy(busy) {
+        sepBusy = busy;
+        el.btnSeparate.disabled = busy;
+        el.btnImportVocals.disabled = busy || !sepVocalsPath;
+        if (busy) {
+            el.sepProgressWrap.classList.add('show');
+            el.sepProgressFill.className = 'fill indet';
+            el.sepProgressText.textContent = '人声分离进行中...';
+        } else {
+            el.sepProgressWrap.classList.remove('show');
+        }
+    }
+
     // ---------- 工具 ----------
     function escapeHtml(s) {
         return String(s).replace(/[&<>"']/g, function (c) {
@@ -714,6 +895,9 @@
         stopRequested = true;
         setStatus('正在停止...', 'warn');
     });
+
+    el.btnSeparate.addEventListener('click', separateVocals);
+    el.btnImportVocals.addEventListener('click', importVocals);
 
     // 语言切换时联动模型框：中文→FunASR（固定，置灰）；英文/其他→whisper large-v3
     function syncModelByLang() {
