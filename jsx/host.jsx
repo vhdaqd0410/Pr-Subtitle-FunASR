@@ -225,11 +225,17 @@ function wsGetSequenceClipsRange(seqId, mode) {
         // all / inout
         var inSec = -1, outSec = -1;
         if (mode === 'inout') {
-            // getInPoint() / getOutPoint() 返回 Real（秒），不是 Time 对象
-            try { inSec = seq.getInPoint(); } catch (e) {}
-            try { outSec = seq.getOutPoint(); } catch (e) {}
+            // getInPoint()/getOutPoint() 正常返回 Real（秒），但个别版本可能返回 Time 对象或 -1，做双重兜底
+            try { inSec = seq.getInPoint(); } catch (e) { inSec = -1; }
+            if (typeof inSec !== 'number' || inSec < 0) {
+                try { var ipt = seq.getInPointAsTime(); if (ipt && ipt.seconds !== undefined) inSec = ipt.seconds; } catch (e2) {}
+            }
+            try { outSec = seq.getOutPoint(); } catch (e) { outSec = -1; }
+            if (typeof outSec !== 'number' || outSec < 0) {
+                try { var opt = seq.getOutPointAsTime(); if (opt && opt.seconds !== undefined) outSec = opt.seconds; } catch (e2) {}
+            }
             if (inSec < 0 || outSec <= inSec) {
-                return JSON.stringify({ error: '无法读取序列出入点，请先在时间轴设置入点(I)和出点(O)' });
+                return JSON.stringify({ error: '无法读取序列出入点（in=' + inSec + ', out=' + outSec + '），请先在时间轴设置入点(I)和出点(O)' });
             }
         }
 

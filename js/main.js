@@ -252,7 +252,14 @@
             var valid = seqMetas.filter(function (m) { return m.clips && m.clips.length > 0; });
             if (valid.length === 0) {
                 setBusy(false);
-                setStatus('没有可识别的序列（可能都是空序列或无媒体）', 'err');
+                // 把每条序列的具体错误透出来，便于定位（不再笼统提示）
+                var firstErr = null;
+                seqMetas.forEach(function (m) { if (m.error && !firstErr) firstErr = m.error; });
+                if (firstErr) {
+                    setStatus('没有可识别内容：' + firstErr, 'err');
+                } else {
+                    setStatus('没有可识别的序列（可能都是空序列或无媒体）', 'err');
+                }
                 return;
             }
             var total = valid.length;
