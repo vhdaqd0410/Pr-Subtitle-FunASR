@@ -15,6 +15,8 @@
     var currentSeqId = null;     // 当前查看的序列 ID
     var batchResults = [];       // 批量结果 [{ seqId, name, status, count, subtitles }]
     var stopRequested = false;   // 停止标志
+    var batchProgressBase = 0;   // 当前序列在总进度里的起点（%）
+    var batchProgressSpan = 0;   // 当前序列占用的进度跨度（%）
     var sepVocalsPath = null;    // 人声分离产物：人声
     var sepAccompPath = null;    // 人声分离产物：伴奏
     var sepBusy = false;         // 分离是否进行中
@@ -33,6 +35,7 @@
         progressWrap: document.getElementById('progressWrap'),
         progressFill: document.getElementById('progressFill'),
         progressText: document.getElementById('progressText'),
+        progressTime: document.getElementById('progressTime'),
         status: document.getElementById('status'),
         resultCard: document.getElementById('resultCard'),
         resultSummary: document.getElementById('resultSummary'),
@@ -53,7 +56,52 @@
         el.status.className = type || '';
     }
 
+    // ---------- 进度条计时 ----------
+    var progressStartMs = null;   // 本次批量开始时刻
+    var progressPct = 0;          // 当前百分比（0~100）
+    var progressTimer = null;     // 刷新已用/剩余时间的定时器
+
+    function fmtDuration(ms) {
+        if (!isFinite(ms) || ms < 0) return '--:--';
+        var totalSec = Math.floor(ms / 1000);
+        var h = Math.floor(totalSec / 3600);
+        var m = Math.floor((totalSec % 3600) / 60);
+        var s = totalSec % 60;
+        if (h > 0) {
+            return h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+        }
+        return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    function startProgressTimer() {
+        progressStartMs = Date.now();
+        progressPct = 0;
+        el.progressTime.textContent = '已用 0:00 · 预计剩余 --';
+        if (progressTimer) clearInterval(progressTimer);
+        progressTimer = setInterval(updateProgressTime, 1000);
+    }
+
+    function updateProgressTime() {
+        if (progressStartMs === null) return;
+        var elapsed = Date.now() - progressStartMs;
+        var eta;
+        if (progressPct > 1) {
+            // 线性外推：已用时间 / 完成比例 = 总时间，剩余 = 总 - 已用
+            eta = Math.round(elapsed / progressPct * (100 - progressPct));
+        } else {
+            eta = -1;  // 进度太小，剩余时间不可估
+        }
+        el.progressTime.textContent = '已用 ' + fmtDuration(elapsed) +
+            ' · 预计剩余 ' + (eta >= 0 ? fmtDuration(eta) : '--');
+    }
+
+    function stopProgressTimer() {
+        if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+        progressStartMs = null;
+    }
+
     function setProgress(pct, text) {
+        progressPct = pct;
         if (pct < 0) {
             el.progressFill.className = 'fill indet';
             el.progressText.textContent = text || '';
@@ -62,6 +110,7 @@
             el.progressFill.style.width = Math.min(100, Math.max(0, pct)) + '%';
             el.progressText.textContent = text || '';
         }
+        updateProgressTime();
     }
 
     function setBusy(busy) {
@@ -71,9 +120,11 @@
         if (busy) {
             el.progressWrap.classList.add('show');
             el.stop.style.display = '';
+            startProgressTimer();
         } else {
             el.progressWrap.classList.remove('show');
             el.stop.style.display = 'none';
+            stopProgressTimer();
         }
     }
 
@@ -252,6 +303,7 @@
             var valid = seqMetas.filter(function (m) { return m.clips && m.clips.length > 0; });
             if (valid.length === 0) {
                 setBusy(false);
+                stopProgressTimer();
                 // 把每条序列的具体错误透出来，便于定位（不再笼统提示）
                 var firstErr = null;
                 seqMetas.forEach(function (m) { if (m.error && !firstErr) firstErr = m.error; });
@@ -262,26 +314,41 @@
                 }
                 return;
             }
+            // 计算每个序列的音频时长（识别耗时≈音频时长，进度按此加权才准）
+            var totalAudioSec = 0;
+            valid.forEach(function (m) {
+                var sec = 0;
+                m.clips.forEach(function (c) { sec += (c.duration || 0); });
+                m.audioSec = sec;
+                totalAudioSec += sec;
+            });
+            totalAudioSec = Math.max(totalAudioSec, 0.001);
             var total = valid.length;
-            setProgress(10, '准备识别 ' + total + ' 个序列');
+            setProgress(5, '准备识别 ' + total + ' 个序列');
 
             // 中文走 FunASR 批量模式：先全部混音，再一次性识别（模型只加载一次）
             if (lang === 'zh') {
-                transcribeZhBatch(valid);
+                transcribeZhBatch(valid, totalAudioSec);
             } else {
+                var doneSec = 0;
                 var done = 0;
                 function transcribeNext(i) {
                     if (stopRequested || i >= total) {
-                        if (stopRequested) { setBusy(false); setStatus('已停止', 'warn'); }
+                        if (stopRequested) { setBusy(false); setStatus('已停止', 'warn'); stopProgressTimer(); }
                         else { finishBatch(); }
                         return;
                     }
                     var meta = valid[i];
                     setStatus('识别中 [' + (i + 1) + '/' + total + '] ' + meta.seqName + '...', '');
+                    // 当前序列占 5%→95% 区间中，与它的音频时长成正比的一段
+                    batchProgressBase = 5 + Math.round(doneSec / totalAudioSec * 90);
+                    batchProgressSpan = Math.max(1, Math.round((meta.audioSec || 0) / totalAudioSec * 90));
                     transcribeOne(meta, function (result) {
                         batchResults.push(result);
                         done++;
-                        var base = 10 + Math.round(done / total * 85);
+                        doneSec += (meta.audioSec || 0);
+                        // 按时长加权推进（5%→95%）
+                        var base = 5 + Math.round(doneSec / totalAudioSec * 90);
                         setProgress(base, '已完成 ' + done + '/' + total + ' 个序列');
                         transcribeNext(i + 1);
                     });
@@ -291,10 +358,11 @@
         }
 
         // 中文批量：先串行混音（快），再一次性 FunASR 识别（模型只加载一次，省 N-1 次 4.6 秒加载）
-        function transcribeZhBatch(metas) {
+        function transcribeZhBatch(metas, totalAudioSec) {
             var total = metas.length;
             var mixTaskList = [];  // [{ meta, wavPath }]
             var mixErrors = [];    // [{ meta, error }]
+            var mixedSec = 0;      // 已混音完成的音频时长（用于混音阶段加权）
 
             function mixNext(i) {
                 if (stopRequested || i >= total) {
@@ -306,7 +374,7 @@
                 var wavPath = path.join(tmpDir, 'mix_' + meta.seqId.slice(0, 8) + '.wav');
                 try { if (fs.existsSync(wavPath)) fs.unlinkSync(wavPath); } catch (e) {}
                 setStatus('混音中 [' + (i + 1) + '/' + total + '] ' + meta.seqName + '...', '');
-                setProgress(10 + Math.round(i / total * 30), '混音 ' + (i + 1) + '/' + total);
+                setProgress(5 + Math.round(mixedSec / totalAudioSec * 20), '混音 ' + (i + 1) + '/' + total);
                 var mixArgs = buildMixArgs(meta.clips, wavPath);
                 child_process.execFile(ffmpegPath, mixArgs, {
                     timeout: 300000,
@@ -317,6 +385,7 @@
                     } else {
                         mixTaskList.push({ meta: meta, wavPath: wavPath });
                     }
+                    mixedSec += (meta.audioSec || 0);
                     mixNext(i + 1);
                 });
             }
@@ -346,7 +415,7 @@
                 fs.writeFileSync(listJsonPath, JSON.stringify(tasks), 'utf8');
 
                 setStatus('FunASR 识别中（模型加载约 4.6 秒，之后很快）...', '');
-                setProgress(40, 'FunASR 识别 0/' + mixTaskList.length);
+                setProgress(25, 'FunASR 识别 0/' + mixTaskList.length);
 
                 var proc = child_process.execFile(pythonExe, [funasrCli, '--multi', listJsonPath, outJsonPath], {
                     timeout: 1800000,
@@ -387,14 +456,20 @@
                     finishBatch();
                 });
 
-                // 读取 stderr 里的 PROGRESS 行，更新进度条
+                // 读取 stderr 里的 PROGRESS 行，更新进度条（按时长加权）
+                var recognizedSec = 0;
                 proc.stderr.on('data', function (chunk) {
                     var s = chunk.toString();
                     var m = s.match(/PROGRESS\s+(\d+)\/(\d+)/);
                     if (m) {
                         var cur = parseInt(m[1], 10);
                         var tot = parseInt(m[2], 10);
-                        setProgress(40 + Math.round(cur / tot * 55), 'FunASR 识别 ' + cur + '/' + tot);
+                        // cur 是已完成的 task 数，累加对应序列时长
+                        recognizedSec = 0;
+                        for (var k = 0; k < cur && k < mixTaskList.length; k++) {
+                            recognizedSec += (mixTaskList[k].meta.audioSec || 0);
+                        }
+                        setProgress(25 + Math.round(recognizedSec / totalAudioSec * 70), 'FunASR 识别 ' + cur + '/' + tot);
                     }
                 });
             }
@@ -464,13 +539,15 @@
             cb({ seqId: meta.seqId, name: meta.seqName, status: 'ok', count: subs.length, subtitles: subs });
         });
 
-        // 解析 whisper 进度（progress = XX%）
+        // 解析 whisper 进度（progress = XX%），映射到当前序列的加权进度区间
         proc.stderr.on('data', function (chunk) {
             var s = chunk.toString();
             var m = s.match(/progress\s*=\s*(\d+)%/);
             if (m) {
                 var p = parseInt(m[1], 10);
                 setStatus('识别中 [' + meta.name + '] ' + p + '%...', '');
+                var inner = batchProgressBase + Math.round(p / 100 * batchProgressSpan);
+                setProgress(Math.min(94, inner), '识别中 [' + meta.name + '] ' + p + '%');
             }
         });
     }
@@ -538,8 +615,13 @@
     }
 
     function finishBatch() {
+        // 先冻结总耗时（计时器还没停），再收尾
+        var totalElapsed = (progressStartMs !== null) ? (Date.now() - progressStartMs) : 0;
         setBusy(false);
         setProgress(100, '完成');
+        if (totalElapsed > 0) {
+            el.progressTime.textContent = '总耗时 ' + fmtDuration(totalElapsed) + ' · 剩余 0:00';
+        }
         var okCount = batchResults.filter(function (r) { return r.status === 'ok'; }).length;
         setStatus('批量完成：成功 ' + okCount + '/' + batchResults.length + ' 个序列', 'ok');
         renderBatchResults();
