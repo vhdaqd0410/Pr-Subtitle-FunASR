@@ -41,10 +41,10 @@ com.zhang.whisper-subtitle/
 
 `bin/`、`models/`、`runtime/` 包含大文件（模型、FFmpeg、whisper 二进制、便携 Python），**未纳入本仓库**（GitHub 单文件 100MB 限制），请从百度网盘下载：
 
-> **百度网盘链接**：（待补充）
-> 提取码：（待补充）
+> **百度网盘链接**：https://pan.baidu.com/s/1GDXJNltFaOvCEMVB7fydww
+> **提取码**：swhm
 
-下载后按上方目录结构放置，即可运行。
+下载解压后即可运行（便携版自带全部运行时与模型，无需安装 Python）。
 
 ## 依赖
 
